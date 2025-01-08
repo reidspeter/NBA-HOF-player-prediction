@@ -1,0 +1,34 @@
+player_id: unique number for each player
+player: first and last name of a player
+g: games played throughout career
+mp_per_game: average minutes played per game
+fg_per_game: average number of field goal(shot) makes per game
+fga_per_game: average number of field goal attempts per game
+fg_percent: fg_per_game/fga_per_game = total field goal make percentage
+x3p_per_game: average number of three point field goal makes per game
+x3pa_per_game: average number of three point field goals attempted per game
+x3p_percent: x3p_per_game/x3pa_per_game = total three point field goal make percentage
+x2p_per_game: average number of two point field goal makes per game
+x2pa_per_game: average number of two point field goals attempted per game
+x2p_percent: x2p_per_game/x2pa_per_game = total two point field goal make percentage
+e_fg_percent: effective field goal percentage, (Field Goals Made + (0.5 * Three-Pointers Made)) / Field Goal Attempts 
+ft_per_game: average number of free throw makes per game
+fta_per_game: average number of free throw attempts per game
+ft_percent: ft_per_game/fta_per_game = total free throw make percentage
+orb_per_game: average number of offensive rebounds per game
+drb_per_game: average number of defensive rebounds per game
+trb_per_game: average number of total rebounds per game
+ast_per_game: average number of assists per game
+stl_per_game: average number of steals per game
+blk_per_game: average number of blocks per game
+tov_per_game: average number of turnovers per game
+pf_per_game: average number of personal fouls per game
+pts_per_game: average number of points scored per game
+allstar_count: number of times the player has been named an allstar
+hof: True(1) or False(0) for if the player was admitted to the hall of fame
+num_seasons: number of seasons the player has played in
+last_seas: the season this player has most recently played in
+
+
+
+

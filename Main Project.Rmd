@@ -1,0 +1,345 @@
+---
+title: "NBA Hall of Fame Prediction"
+author: "Reid Peterson"
+date: "2024-10-11"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidymodels)
+library(corrplot)
+library(naniar)
+library(discrim)
+library(pROC)
+library(xgboost)
+```
+
+
+### Introduction
+
+Since 1959, the National Basketball Association (NBA) has honored and celebrated exceptional players via Hall of Fame (HOF) induction. This is such an outstanding accomplishment that only around 450 people, including non-players such as coaches, refs, etc., have been honored in total. However, the basis for choosing such players is not very straightforward. There are many rounds of voting based on not just on-court statistics, but also off-court accomplishments, e.g. sportsmanship or influence. Unfortunately for me, this slightly pushes the decision towards the subjective side. Throughout this project though, I will do my best to find and utilize the most relevant statistics to predict whether or not a player might be inducted into the HOF.
+
+The main goal of this project is to create a model that can make predictions for current NBA players who's HOF status has yet to be determined. (To be eligible for the HOF, a player must be retired for at least 4 years. So for our purposes, "current" will refer to players currently in the league as well as those who have been retired for <4 years). The predictions will take the form of either 1: being admitted, or 2: not being admitted, making this a binary classification problem. In order to make predictions for current players, and for the sake of accurate EDA, we will begin by splitting the data set into past and current players, and from there split the past players set into training and testing components. Also noteworthy, it's imperative that we remove the current players from the training set anyways, because if we didn't they would skew the model. Other steps involve fitting different model types to the past players data set, determining the best model type, and boom, applying it to current players. Now with the overview out of the way lets begin with loading in the data:
+
+
+```{r data}
+allstar <- read.csv("C:\\Users\\reidp\\Desktop\\Pstat 131\\NBA STATs\\All-Star Selections.csv")
+hofd <- read.csv("C:\\Users\\reidp\\Desktop\\Pstat 131\\NBA STATs\\Player Career Info.csv")
+pergame <- read.csv("C:\\Users\\reidp\\Desktop\\Pstat 131\\NBA STATs\\Player Per Game.csv")
+```
+
+I gathered this data from a larger set in Kaggle:
+Sumitro Datta. NBA Stats(1947-present),. Retrieved 10/12/24 from https://www.kaggle.com/datasets/sumitrodatta/nba-aba-baa-stats?select=Player+Per+Game.csv 
+
+In it's current form, all the necessary data is separated into three different files, so I'll need to manually combine them by the name variable. Also, there are many tidying steps I will need to undertake. When determining Hall of Fame (HOF) chances, it's more important and also simpler to consider a players' career data as opposed to individual seasons. So before I combine all three data sets, I will first have to condense the per game data, as it's currently divided by seasons. In doing so, I will also drop variables that I believe won't play much into HOF determination, e.g. birth year, age, position, etc.
+
+Here is the tidied data set:
+
+```{r tidying}
+totalpergame <- subset(pergame, select = -c(seas_id, season, player, birth_year, pos, age, experience, lg, tm, gs)) %>% mutate_at(3:25, ~.*g) 
+play <- subset(pergame, select = c(player_id, player)) %>% unique()
+cpg <- aggregate(.~player_id, data = totalpergame, FUN=sum, na.action = na.pass) %>%  mutate_at(3:25, ~./g) %>% mutate_at(3:25, round, 3)
+tcpg <- merge(play, cpg, by = "player_id")
+ascount <- allstar %>% count(player)
+ptwo <- merge(tcpg, ascount, by = "player", all.x = TRUE) %>% mutate(n = coalesce(n,0))
+colnames(ptwo)[27] <- "allstar_count"
+nhof <- subset(hofd, select = -c(birth_year, first_seas, player)) 
+finset <- merge(ptwo, nhof, by = "player_id") 
+ncset <- finset[finset$last_seas <= 2020,] %>% mutate(hof = as.numeric(hof))
+head(ncset)
+```
+
+Now that our main data set is tidied, and we have all of our necessary predictors, we can separate past and current players, and perform some EDA. Additionally, if any of the predictors seem unclear, there will be a codebook attached.
+
+
+### Exploratory Data Analysis
+
+First we will take a look at a correlation matrix which includes the output(HOF), and all the predictors that are potential candidates for our model recipe. I chose to include the output so we could see which predictors appeared to have the greatest impact on HOF admittance. 
+
+```{r}
+corrset <- subset(ncset, select = -c(player, player_id)) %>% mutate(hof = as.numeric(hof))
+corrplot(cor(corrset, use = "complete.obs"), method="square", tl.cex = 0.8, cex.axis = 1)
+
+```
+
+Immediately we can see there is quite a lot of positive correlation. Actually, it seems that with an increase in basically any statistic, we should expect an increase in all the others. Anyways the first takeaway I had was that we should remove all the attempted shot predictors(i.e. fga, 2pa, 3pa, fta) because we already have shooting percentage and made shots, so including attempts would be redundant. On this train of thought, we could also remove the other field goal predictors(fg per game, and fg_percent), as well as pts_per_game, as they are just combinations of the 2p per game, 3p per game, and ft per game (we won't be losing any data). Next I saw that the number of games and seasons are very correlated, and both aren't necessary, so I will remove number of seasons. Lastly, I will remove last season from the recipe, as it doesn't have any real effect on HOF admittance. Despite these moves, there will still be a fair amount of correlation amongst the predictors, e.g. tov_per_game, and 2p_per_game; however, I believe all the needed changes have been made, and these correlations will not be problematic. Lets see the lowered correlation matrix:
+
+```{r}
+newcorrset <- subset(ncset, select = -c(player, player_id, fg_per_game, fga_per_game, fg_percent, x2pa_per_game, fta_per_game, pts_per_game, num_seasons, last_seas)) %>% mutate(hof = as.numeric(hof))
+corrplot(cor(newcorrset, use = "complete.obs"), method="square", tl.cex = 0.8, cex.axis = 1)
+
+```
+
+As we can see, most of the very strong correlations are no longer here.
+Next we should take a closer look at the strongest predictors of HOF admittance, or in other words, those with the highest correlation with the hof variable. Let's examine allstar_count, ft_per_game, and games played(g):
+
+```{r}
+ncset %>%
+  select("allstar_count", "hof") %>%
+   mutate(hof = factor(hof, levels = c(0, 1), labels = c("No HOF", "HOF"))) %>%
+  group_by(allstar_count) %>%
+  na.omit(allstar_count) %>%
+  ggplot(aes(allstar_count)) +
+  geom_bar(aes(fill = hof), position="fill", stat="count")+
+  scale_fill_manual(values = c("lightblue", "lightgreen")) + 
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+```{r}
+ncset %>%
+  select("ft_per_game", "hof") %>%
+   mutate(hof = factor(hof, levels = c(0, 1), labels = c("No HOF", "HOF"))) %>%
+  mutate(ft_per_game = cut(ft_per_game, breaks = c(seq(0, max(ft_per_game), by = 0.5), max(ft_per_game)),include.lowest = TRUE)) %>% 
+  group_by(ft_per_game) %>%
+  na.omit(ft_per_game) %>%
+  ggplot(aes(ft_per_game)) +
+  geom_bar(aes(fill = hof), position="fill", stat="count")+
+  scale_fill_manual(values = c("lightblue", "lightgreen")) + 
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+```{r}
+ncset %>%
+  select("g", "hof") %>%
+   mutate(hof = factor(hof, levels = c(0, 1), labels = c("No HOF", "HOF"))) %>%
+  mutate(g = cut(g, breaks = c(seq(0, max(g), by = 100), max(g)),include.lowest = TRUE)) %>% 
+  group_by(g) %>%
+  na.omit(g) %>%
+  ggplot(aes(g)) +
+  geom_bar(aes(fill = hof), position="fill", stat="count")+
+  scale_fill_manual(values = c("lightblue", "lightgreen")) + 
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+All these percent stacked bar charts support the notion that "the more, the merrier" does in fact apply to NBA statistics. Side note: I decided to use percent stacked bar charts as opposed to regular bar charts for readability purposes; there is a very thick concentration of players in the first bar for all of these charts.
+
+### Missing Data
+
+Now that we are a bit more familiar with the data, we can move on to our final step before modelling, which is handling the missing data. Let's begin by seeing what exactly we are missing:
+
+```{r}
+gg_miss_var(newcorrset)
+```
+
+Note: in this code chunk we transition into the less correlated predictor combination that we saw with the matrices, and plan on using for our modelling recipe.
+
+This amount of missing data is definitely concerning, but it shouldn't affect the project too significantly. In moving forward we have two options: 1) Cut off the data at 1980, as the 1979-1980 season is when they first started tracking all the modern stats, (by "cutting off", I mean that we will only include players who started playing in and after 1980), or 2) remove all the predictors with missing data. Ultimately I think option 1) will work out the best as we will still have plenty of data to work with, and I believe that we need as many predictors as we can get. 
+
+```{r}
+midset <- ncset[ncset$last_seas-ncset$num_seasons >= 1980,]
+recset <- subset(midset, select = -c(player, player_id, fg_per_game, fga_per_game, fg_percent, x2pa_per_game, fta_per_game, pts_per_game, num_seasons, last_seas))
+gg_miss_var(recset)
+```
+
+So we still have a little bit of missing data, but luckily the corresponding predictors can be easily imputed with similar statistics. Now, let's split our data and build our recipe:
+
+```{r}
+set.seed(763)
+midset <- midset %>% mutate(hof = as.factor(hof))
+midset_split <- initial_split(midset, prop = 0.75, strata = hof)
+midset_train <- training(midset_split)
+midset_test <- testing(midset_split)
+midset_fold <- vfold_cv(midset_train, v = 5, strata = hof)
+hofp_recipe <- recipe(hof ~ ., data = midset_train) %>% step_rm(player, player_id, fg_per_game, fga_per_game, fg_percent, x2pa_per_game, fta_per_game, pts_per_game, num_seasons, last_seas) %>% step_impute_knn(all_of(c("x3p_percent","ft_percent", "x2p_percent", "e_fg_percent", "x3pa_per_game", "x3p_per_game"))) %>% step_normalize(all_predictors()) 
+```
+
+The imputed data obviously won't be perfect, but for the most part the original missing data points, i.e. where the imputed values went, had insignificant impact anyways. For example any player without a x3p_percent value typically had taken a very small amount of 3 point shots to begin with. 
+
+### Training the Models
+
+Now that we have our recipe ready to go we can create our models. The model types I plan on including are: logistic regression, LDA, QDA, a random forest, and a boosted tree. Also, for the sake of aesthetics and time, we will save and load in our model results.  Lets start with the first three model types in the list:
+
+```{r, eval=FALSE, include = FALSE}
+lgr_hofp <- logistic_reg() %>% 
+   set_engine("glm")%>% set_mode("classification")
+lgr_wflow <- workflow() %>% 
+  add_model(lgr_hofp) %>% 
+  add_recipe(hofp_recipe)
+lgr_fit <- fit(lgr_wflow, midset_train)
+
+lgr_train <- bind_cols(predict(lgr_fit, new_data = midset_train), midset_train) %>% mutate(hof = as.numeric(hof)) %>% 
+mutate(.pred_class= as.numeric(.pred_class))
+lgr_roc <- roc(lgr_train$hof, lgr_train$.pred_class)
+lgr_auc <- auc(lgr_roc)
+save(lgr_auc, file = "hflgr_auc.rda")
+
+lda_hofp <- discrim_linear() %>% 
+   set_engine("MASS")%>% set_mode("classification")
+lda_wflow <- workflow() %>% 
+  add_model(lda_hofp) %>% 
+  add_recipe(hofp_recipe)
+lda_fit <- fit(lda_wflow, midset_train)
+
+lda_train <- bind_cols(predict(lda_fit, new_data = midset_train), midset_train) %>% mutate(hof = as.numeric(hof)) %>% 
+mutate(.pred_class= as.numeric(.pred_class))
+lda_roc <- roc(lda_train$hof, lda_train$.pred_class)
+lda_auc <- auc(lda_roc)
+save(lda_auc, file = "hflda_auc.rda")
+
+qda_hofp <- discrim_quad() %>% 
+   set_engine("MASS")%>% set_mode("classification")
+qda_wflow <- workflow() %>% 
+  add_model(qda_hofp) %>% 
+  add_recipe(hofp_recipe)
+qda_fit <- fit(qda_wflow, midset_train)
+
+qda_train <- bind_cols(predict(qda_fit, new_data = midset_train), midset_train) %>% mutate(hof = as.numeric(hof)) %>% 
+mutate(.pred_class= as.numeric(.pred_class))
+qda_roc <- roc(qda_train$hof, qda_train$.pred_class)
+qda_auc <- auc(qda_roc)
+save(qda_auc, file = "hfqda_auc.rda")
+```
+```{r}
+load("hflgr_auc.rda")
+load("hflda_auc.rda")
+load("hfqda_auc.rda")
+```
+
+For the Logistic Regression:
+
+```{r}
+lgr_auc
+```
+
+For the Linear Discriminant Analysis:
+
+```{r}
+lda_auc
+```
+
+For the Quadratic Discriminant Analysis:
+
+```{r}
+qda_auc
+```
+
+As we can see, the three simpler model types did quite well on the training set, with the QDA model fit being especially impressive boasting an AUC-ROC score of ~0.977. Considering how high these scores are, I wouldn't be surprised to see a drop if these models are fit to the testing data set. Anyways, let's see how the random forest and boosted tree model types compare:
+
+```{r, include = FALSE}
+rf_model <- rand_forest(mtry = tune(), 
+                           trees = tune(), 
+                           min_n = tune()) %>% set_engine("ranger", importance = "impurity") %>% set_mode("classification")
+
+rf_wf <- workflow() %>% 
+  add_model(rf_model) %>% 
+  add_recipe(hofp_recipe)
+```
+
+```{r, eval=FALSE, include = FALSE}
+rf_grid <- grid_regular(mtry(range = c(4, 12)), trees(range = c(200, 600)), min_n(range = c(20, 30)), levels = 9)
+
+hftune_rf <- tune_grid(
+  rf_wf, 
+  resamples = midset_fold, 
+  grid = rf_grid,
+  metrics = metric_set(roc_auc))
+
+save(hftune_rf, file = "hftune_rf.rda")
+
+```
+
+```{r, include = FALSE}
+bt_model <- boost_tree(trees = tune()) %>% set_engine("xgboost") %>% set_mode("classification")
+bt_wf <- workflow() %>% 
+  add_model(bt_model) %>% 
+  add_recipe(hofp_recipe)
+```
+
+```{r, eval = FALSE, include = FALSE}
+bt_grid <- grid_regular(trees(range = c(50, 1500)), levels = 8)
+
+hftune_bt <- tune_grid(
+  bt_wf, 
+  resamples = midset_fold, 
+  grid = bt_grid,
+  metrics = metric_set(roc_auc))
+
+save(hftune_bt, file = "hftune_bt.rda")
+
+```
+
+The results from the random forest:
+
+```{r}
+load("hftune_rf.rda")
+autoplot(hftune_rf) + theme_minimal()
+arrange(collect_metrics(hftune_rf), desc(mean))[1,]
+```
+
+We can see that random forest #327 did incredibly well with an AUC-ROC of ~0.991; the associated tuned parameters were mtry = 6, trees = 200, and min_n = 25. 
+
+For the boosted tree we have:
+
+```{r}
+load("hftune_bt.rda")
+autoplot(hftune_bt) + theme_minimal()
+arrange(collect_metrics(hftune_bt), desc(mean))[1,]
+```
+
+Another great model, the boosted tree #2 received an AUC-ROC of ~0.987, and had 257 trees. 
+
+I'd be lying if I said I wasn't a little bit surprised at how well these two models performed.  These two are the best performing models based on AUC-ROC with the random forest ~0.991 , and the boosted tree ~0.987. The random forest slightly edges out the boosted tree, so that is what we will use on our testing set, and eventually make predictions on current players.
+
+### Testing Set
+
+```{r}
+set.seed(10)
+best_modelrf <- select_best(hftune_rf)
+bm_wf <- finalize_workflow(rf_wf, best_modelrf)
+bm_fit <- fit(bm_wf, midset_train) 
+final_rf_test <- augment(bm_fit, midset_test) %>% mutate(.pred_class = as.numeric(.pred_class)) %>% mutate(.pred_class = factor(.pred_class - 1, levels = c(0, 1))) %>% 
+select(hof, starts_with(".pred"))
+roc_auc(final_rf_test, truth = hof, .pred_0)
+```
+
+Wow, the best random forest's testing AUC-ROC remains very high at around ~0.939. This is a great score and shows that the predictor will almost always be right. To get the specifics from the testing set, lets make a confusion matrix:
+
+```{r}
+conf_mat(final_rf_test, truth = hof, 
+         .pred_class) %>% 
+  autoplot(type = "heatmap")
+```
+
+After viewing the confusion matrix, the very high AUC-ROC doesn't seem quite as impressive, but the model is clearly still effective. The errors in the model were that it incorrectly predicted 3 actual HOFers as not being in the HOF. So, the model correctly guessed 600/600 non-HOFers and 7/10 actual HOFers. It is important to note though, that the erroneous predictions were all on the fence players that received near 50/50 probabilities by the model. 
+
+### Predictions On Current Players
+
+Now for the best part! Despite not being able to check the validity of these next predictions, I still want to see what my model predicts for some of my favorite players. Let's do Kevin Durant, De'aaron Fox, and Keegan Murray:
+
+```{r}
+set.seed(98)
+finset <- finset %>% mutate(hof = as.numeric(hof))
+kd <- finset[finset$player == "Kevin Durant",]
+kd_test <- augment(bm_fit, kd) %>% mutate(.pred_class = as.numeric(.pred_class)) %>% mutate(.pred_class = factor(.pred_class - 1, levels = c(0, 1))) %>% 
+select(starts_with(".pred"))
+kd_test
+df <- finset[finset$player == "De'Aaron Fox",]
+df_test <- augment(bm_fit, df) %>% mutate(.pred_class = as.numeric(.pred_class)) %>% mutate(.pred_class = factor(.pred_class - 1, levels = c(0, 1))) %>% 
+select(starts_with(".pred"))
+df_test
+km <- finset[finset$player == "Keegan Murray",]
+km_test <- augment(bm_fit, km) %>% mutate(.pred_class = as.numeric(.pred_class)) %>% mutate(.pred_class = factor(.pred_class - 1, levels = c(0, 1))) %>% 
+select(starts_with(".pred"))
+km_test
+
+```
+
+Wow! These are all completely realistic probabilities. I intentionally chose players with very different likelihoods of making the HOF(if they were to all retire tomorrow), and the model was able to easily detect this! For reference: 
+
+Kevin Durant: 16 seasons, 14 all star appearances, 27.3 points per game(ppg), our model predicted HOF = 1 with a predicted ~88.1% chance of admittance.
+
+(Remember 0 = No HOF, 1 = HOF)
+
+De'Aaron Fox: 7 seasons, 1 all star appearance, 21.2 ppg, our model predicted HOF = 0 with a predicted ~21.9% chance of admittance.
+
+Keegan Murray: 2 seasons, 0 all star appearances, 13.7 ppg, our model predicted HOF = 0 with a predicted ~9.3% chance of admittance.
+
+### Conclusion
+
+Well, this has been quite the journey! From the gathering and tidying of the data, to our final results and predictions, I would say this project has been a success. We were able to overcome the obstacles of multicollinearity, missing data, and the rules regarding HOF admittance, with predictor reduction, imputation, and data frame manipulation respectively. All five of our model types did very well in terms of AUC-ROC on our training dataset, with our random forest #327 model having an outstanding score of ~0.991. This score actually increased on the testing set, where it rose to ~0.993. Despite these numbers, there is still much room for improvement in this model. 
+
+According to our confusion matrix, our model was only able to correctly guess 8/11 HOFers, which isn't bad, but it's far from perfect. I believe that this model would see it's biggest improvements from incorporating more career related predictors such as end of season awards, and championships won. This would require a bit more data searching, but should be reasonably simple to pull off. There are also the off-court considerations like social impact, and sportsmanship that factor into the HOF consideration. But who knows, maybe in the future we could implement advanced neural networks to track and analyze all aspects of a players life? I'm just playing. Ultimately, I would consider this project to be a success, and I thank you for joining me on this adventure!
