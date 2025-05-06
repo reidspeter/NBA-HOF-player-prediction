@@ -1,0 +1,1 @@
+Tidied and transformed a basic player statistics dataset ranging back to 1947 and performed EDA to further refine. Trained logistic regression, QDA, random forest, and boosted tree models to successfully predict players’ chances with an AUC-ROC of ~0.991.
